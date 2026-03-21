@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { google } from "@ai-sdk/google";
 import { generateText, tool, stepCountIs } from "ai";
 import { z } from "zod";
+import { readFileSync } from "fs";
+import { join } from "path";
 import {
   runnerCall,
   setPsu,
@@ -21,6 +23,23 @@ import {
 
 const RUNNER_URL = process.env.RUNNER_URL || "http://benchagent-pi:8420";
 
+// Load wiring reference docs at startup (not per-request)
+let WIRING_CHEATSHEET = "";
+let FULL_WIRING_REFERENCE = "";
+try {
+  const docsDir = join(process.cwd(), "..", "docs");
+  WIRING_CHEATSHEET = readFileSync(join(docsDir, "WIRING_CHEATSHEET.md"), "utf-8");
+  FULL_WIRING_REFERENCE = readFileSync(join(docsDir, "ESP32-S3-DevKitC-1-U-WIRING-REFERENCE.md"), "utf-8");
+} catch {
+  // Fallback: try relative to project root
+  try {
+    WIRING_CHEATSHEET = readFileSync(join(process.cwd(), "docs", "WIRING_CHEATSHEET.md"), "utf-8");
+    FULL_WIRING_REFERENCE = readFileSync(join(process.cwd(), "docs", "ESP32-S3-DevKitC-1-U-WIRING-REFERENCE.md"), "utf-8");
+  } catch {
+    console.warn("[agent] Wiring docs not found — agent will have limited wiring guidance");
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
@@ -29,26 +48,32 @@ export async function POST(req: Request) {
       model: google("gemini-3.1-pro-preview"),
       system: `You are Benchy, an AI hardware test agent. You control real lab instruments to test, diagnose, and fix hardware issues on ESP32-S3 development boards.
 
-Available instruments:
+## Instruments
 - DPS-150 Power Supply (0-30V, 0-5.5A) — set voltage, current limit, sweep
 - Digilent Analog Discovery — oscilloscope (2ch, 0-indexed), waveform generator, logic analyzer, protocol decoders (I2C/SPI/UART)
 - ESP32-S3 DUT board — configurable via JSON commands (PWM, I2C, UART, CAN, GPIO, ADC, WiFi)
 - ESP32-S3 Fixture board — I2C slave, DUT reset control, load injection, UART relay
+- Phone camera — live video stream for bench verification (use camera_analyze tool)
 
-When the user describes a test, you should:
-1. Plan the experiment steps
-2. Execute them using tools
-3. Analyze the results (waveform data, measurements, UART logs)
-4. Report findings with specific measurements and units
-5. If there's a failure, diagnose the root cause and suggest/apply fixes
+## Workflow
+1. If the user needs help with wiring, use camera_analyze to see the bench and guide them. You can also use the wiring_reference tool for detailed pin information.
+2. Plan the experiment steps
+3. Execute using tools (set_psu, capture_scope, dut_command, etc.)
+4. Analyze results (waveform stats, UART logs, scope charts)
+5. Report findings with specific measurements and units
+6. If failure detected, diagnose root cause and suggest/apply fixes
 
-IMPORTANT:
-- Scope channels are 0-indexed (0 = CH1, 1 = CH2)
+## Rules
+- Scope channels: 0-indexed (0=CH1, 1=CH2)
 - Always enable PSU output when setting voltage (output=true)
-- DUT commands are flat JSON objects like {"cmd":"pwm","pin":4,"freq":1000,"duty":50}
-- Chart images are available at artifact URLs for visual analysis
+- DUT commands are flat JSON: {"cmd":"pwm","pin":4,"freq":1000,"duty":50}
+- ESP32-S3 is 3.3V logic — NEVER set PSU above 3.6V when powering 3V3 pin directly
+- Safety clamps: max 5.5V, max 1.0A (enforced by Pi worker)
 
-Be concise and technical. Report measurements with units.`,
+## Quick Wiring Reference
+${WIRING_CHEATSHEET || "(wiring docs not loaded)"}
+
+Be concise and technical. Report measurements with units. When guiding wiring, reference specific header pins (e.g., "connect to J1-4 which is GPIO4").`,
       messages,
       tools: {
         set_psu: tool({
@@ -357,6 +382,71 @@ Examples:
           },
         }),
 
+        wiring_reference: tool({
+          description: `Look up detailed wiring information for the ESP32-S3-DevKitC-1-U board.
+Use this when you need:
+- Exact GPIO pin numbers and header positions
+- Which pins are safe vs reserved (USB, strapping, PSRAM)
+- ADC channel assignments
+- Peripheral pin defaults (I2C, SPI, UART, CAN)
+- Power supply connection details
+- Board orientation and header layout
+
+The quick cheatsheet is already in your system prompt. Use this tool for the FULL reference (pinout tables, safety classification, strapping pin details).`,
+          inputSchema: z.object({
+            section: z
+              .string()
+              .optional()
+              .describe(
+                "Optional: specific section to look up (e.g., 'pinout', 'power', 'i2c', 'safety', 'strapping'). If omitted, returns the full reference."
+              ),
+          }),
+          execute: async ({ section }) => {
+            if (!FULL_WIRING_REFERENCE) {
+              return {
+                error:
+                  "Wiring reference not loaded. Use the cheatsheet in the system prompt.",
+              };
+            }
+            if (section) {
+              // Find the relevant section by heading
+              const lines = FULL_WIRING_REFERENCE.split("\n");
+              const sectionLower = section.toLowerCase();
+              let capturing = false;
+              let result = "";
+              let depth = 0;
+              for (const line of lines) {
+                if (
+                  line.startsWith("#") &&
+                  line.toLowerCase().includes(sectionLower)
+                ) {
+                  capturing = true;
+                  depth = line.split(" ")[0].length; // number of # chars
+                  result += line + "\n";
+                } else if (capturing) {
+                  if (
+                    line.startsWith("#") &&
+                    line.split(" ")[0].length <= depth
+                  ) {
+                    break; // hit next section at same or higher level
+                  }
+                  result += line + "\n";
+                }
+              }
+              return {
+                section,
+                content:
+                  result || `Section '${section}' not found. Try: pinout, power, safety, strapping, wiring, i2c, uart, adc`,
+              };
+            }
+            // Return full doc (truncated if huge)
+            return {
+              content: FULL_WIRING_REFERENCE.slice(0, 15000),
+              truncated: FULL_WIRING_REFERENCE.length > 15000,
+            };
+          },
+        }),
+
         camera_snapshot: tool({
           description:
             "Take a photo from the phone camera stream currently pointed at the lab bench. Returns the image URL. Use this before camera_analyze to confirm the camera is working.",
@@ -406,8 +496,9 @@ The phone must be streaming video via the Flutter app.`,
           },
         }),
       },
-      maxSteps: 15,
-    });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      maxSteps: 15 as any,
+    } as any);
 
     return NextResponse.json({
       text: result.text,
