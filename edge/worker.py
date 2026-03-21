@@ -1098,6 +1098,86 @@ async def run_benchmark(req: BenchmarkRunReq):
         raise HTTPException(500, str(e))
 
 
+# ── Firmware Management (used by firmware pipeline) ──────────────
+
+class FirmwareWriteReq(BaseModel):
+    project_path: str
+    files: dict  # {filename: code_string}
+
+
+class FirmwareCompileReq(BaseModel):
+    project_path: str
+    target: str = "esp32s3"
+
+
+@app.post("/firmware/write")
+async def firmware_write(req: FirmwareWriteReq):
+    """Write firmware source files to disk for compilation."""
+    project = Path(req.project_path)
+    project.mkdir(parents=True, exist_ok=True)
+
+    written = []
+    for filename, code in req.files.items():
+        fpath = project / filename
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(code)
+        written.append(filename)
+
+    return {"ok": True, "files_written": written, "project_path": str(project)}
+
+
+@app.post("/firmware/compile")
+async def firmware_compile(req: FirmwareCompileReq):
+    """Compile firmware using PlatformIO. Returns build result."""
+    import subprocess
+
+    project = Path(req.project_path)
+    if not project.exists():
+        raise HTTPException(404, f"Project path does not exist: {req.project_path}")
+
+    try:
+        start = time.time()
+        result = subprocess.run(
+            ["pio", "run"],
+            cwd=str(project),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        build_time = time.time() - start
+
+        if result.returncode == 0:
+            # Try to find binary size
+            size_bytes = 0
+            for line in result.stdout.split("\n"):
+                if "bytes" in line.lower() and ("flash" in line.lower() or "program" in line.lower()):
+                    import re as _re
+                    m = _re.search(r"(\d+)\s*bytes", line)
+                    if m:
+                        size_bytes = int(m.group(1))
+                        break
+
+            return {
+                "ok": True,
+                "build_time_s": round(build_time, 1),
+                "size_bytes": size_bytes,
+                "output": result.stdout[-2000:],
+            }
+        else:
+            return {
+                "ok": False,
+                "build_time_s": round(build_time, 1),
+                "output": result.stdout[-2000:],
+                "errors": result.stderr[-2000:],
+            }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Build timed out (180s)")
+    except FileNotFoundError:
+        raise HTTPException(503, "PlatformIO (pio) not found. Install with: pip install platformio")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ── Main ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn

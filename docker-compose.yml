@@ -7,10 +7,31 @@ services:
       - "3002:3000"
     env_file:
       - ./frontend/.env
+    environment:
+      - PIPELINE_URL=http://pipeline:8002
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
         tag: "benchy-frontend"
+    restart: unless-stopped
+
+  pipeline:
+    build:
+      context: ./pipeline
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL:-https://nkzomvuogwnynygaisjp.supabase.co}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY}
+      - RUNNER_URL=${RUNNER_URL:-http://benchagent-pi:8420}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "benchy-pipeline"
     restart: unless-stopped

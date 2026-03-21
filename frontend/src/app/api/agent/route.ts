@@ -26,7 +26,7 @@ export async function POST(req: Request) {
     const { messages } = await req.json();
 
     const result = await generateText({
-      model: google("gemini-2.0-flash"),
+      model: google("gemini-3.1-pro-preview"),
       system: `You are Benchy, an AI hardware test agent. You control real lab instruments to test, diagnose, and fix hardware issues on ESP32-S3 development boards.
 
 Available instruments:
@@ -357,7 +357,7 @@ Examples:
           },
         }),
       },
-      maxSteps: 15,
+      stopWhen: stepCountIs(15),
     });
 
     return NextResponse.json({
