@@ -17,8 +17,10 @@ from typing import Any
 
 import numpy as np
 import serial
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import base64
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 # ── Constants ────────────────────────────────────────────────────
@@ -35,6 +37,12 @@ log = logging.getLogger("benchagent")
 _ad2 = None       # DigilentDwfClient
 _psu = None       # DPS150
 _esp: dict[str, serial.Serial] = {}  # "a" / "b" -> Serial
+
+# Camera frame buffer — latest JPEG from the Flutter app
+_camera_lock = threading.Lock()
+_camera_frame: bytes | None = None
+_camera_last_ts: float = 0.0
+_camera_connected = False
 
 
 def _find_esp32_ports() -> dict[str, str]:
@@ -1096,6 +1104,137 @@ async def run_benchmark(req: BenchmarkRunReq):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ── Camera (video stream from Flutter app) ───────────────────────
+
+class CameraAnalyzeReq(BaseModel):
+    prompt: str = "Describe what you see on this lab bench. Identify instruments, wiring, and any issues."
+    model: str = "gemini-3.1-flash-lite-preview"
+
+
+@app.websocket("/camera/ws")
+async def camera_ws(ws: WebSocket):
+    """Receive JPEG frames from the Flutter app over WebSocket."""
+    global _camera_frame, _camera_last_ts, _camera_connected
+    await ws.accept()
+    _camera_connected = True
+    log.info("Camera connected")
+
+    try:
+        while True:
+            # Expect binary JPEG frames
+            data = await ws.receive_bytes()
+            if len(data) < 100:
+                continue  # skip tiny/invalid frames
+
+            with _camera_lock:
+                _camera_frame = data
+                _camera_last_ts = time.time()
+
+    except WebSocketDisconnect:
+        log.info("Camera disconnected")
+    except Exception as e:
+        log.warning("Camera WebSocket error: %s", e)
+    finally:
+        _camera_connected = False
+
+
+@app.get("/camera/latest")
+async def camera_latest():
+    """Return the latest camera frame as JPEG."""
+    with _camera_lock:
+        frame = _camera_frame
+        ts = _camera_last_ts
+
+    if frame is None:
+        raise HTTPException(404, "No camera frame available. Connect the Flutter app first.")
+
+    age = time.time() - ts
+    if age > 30:
+        raise HTTPException(410, f"Camera frame is stale ({age:.0f}s old). Is the app still streaming?")
+
+    return Response(content=frame, media_type="image/jpeg",
+                    headers={"X-Frame-Age-Ms": str(int(age * 1000))})
+
+
+@app.post("/camera/snapshot")
+async def camera_snapshot():
+    """Save the latest camera frame to artifacts and return the URL."""
+    with _camera_lock:
+        frame = _camera_frame
+        ts = _camera_last_ts
+
+    if frame is None:
+        raise HTTPException(404, "No camera frame available")
+
+    fname = f"camera_{int(ts * 1000)}.jpg"
+    fpath = ARTIFACTS_DIR / fname
+    fpath.write_bytes(frame)
+
+    return {
+        "ok": True,
+        "artifact_url": f"/artifacts/{fname}",
+        "frame_age_ms": int((time.time() - ts) * 1000),
+        "size_bytes": len(frame),
+    }
+
+
+@app.post("/camera/analyze")
+async def camera_analyze(req: CameraAnalyzeReq):
+    """Send the latest camera frame to Gemini vision for analysis."""
+    with _camera_lock:
+        frame = _camera_frame
+        ts = _camera_last_ts
+
+    if frame is None:
+        raise HTTPException(404, "No camera frame available. Connect the Flutter app first.")
+
+    age = time.time() - ts
+    if age > 30:
+        raise HTTPException(410, f"Camera frame is stale ({age:.0f}s old)")
+
+    # Save snapshot as artifact
+    fname = f"camera_{int(ts * 1000)}.jpg"
+    fpath = ARTIFACTS_DIR / fname
+    fpath.write_bytes(frame)
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", ""))
+        model = genai.GenerativeModel(req.model)
+
+        # Send image to Gemini vision
+        import PIL.Image
+        import io as _io
+        img = PIL.Image.open(_io.BytesIO(frame))
+
+        response = model.generate_content([req.prompt, img])
+
+        return {
+            "ok": True,
+            "analysis": response.text,
+            "model": req.model,
+            "artifact_url": f"/artifacts/{fname}",
+            "frame_age_ms": int(age * 1000),
+        }
+    except Exception as e:
+        log.error("Camera analysis failed: %s", e)
+        raise HTTPException(500, f"Vision analysis failed: {e}")
+
+
+@app.get("/camera/status")
+async def camera_status():
+    """Check camera connection status."""
+    with _camera_lock:
+        has_frame = _camera_frame is not None
+        age = time.time() - _camera_last_ts if has_frame else None
+
+    return {
+        "connected": _camera_connected,
+        "has_frame": has_frame,
+        "frame_age_ms": int(age * 1000) if age is not None else None,
+    }
 
 
 # ── Firmware Management (used by firmware pipeline) ──────────────

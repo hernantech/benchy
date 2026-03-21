@@ -186,3 +186,17 @@ export async function getCapabilities() {
 export async function getArtifactUrl(filename: string) {
   return `${RUNNER_URL}/artifacts/${filename}`;
 }
+
+// ── Camera ──────────────────────────────────────────────────────
+
+export async function cameraSnapshot() {
+  return runnerCall("/camera/snapshot");
+}
+
+export async function cameraAnalyze(prompt: string, model: string = "gemini-3.1-flash-lite-preview") {
+  return runnerCall("/camera/analyze", { prompt, model });
+}
+
+export async function cameraStatus() {
+  return runnerCall("/camera/status");
+}

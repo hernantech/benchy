@@ -356,8 +356,57 @@ Examples:
             return await getCapabilities();
           },
         }),
+
+        camera_snapshot: tool({
+          description:
+            "Take a photo from the phone camera stream currently pointed at the lab bench. Returns the image URL. Use this before camera_analyze to confirm the camera is working.",
+          inputSchema: z.object({}),
+          execute: async () => {
+            const res = await runnerCall("/camera/snapshot");
+            if (res.artifact_url) {
+              res.image_url = `${RUNNER_URL}${res.artifact_url}`;
+            }
+            return res;
+          },
+        }),
+
+        camera_analyze: tool({
+          description: `Analyze the lab bench using the phone camera + Gemini vision.
+Use this to:
+- Verify wiring is correct before running tests ("Are the I2C wires connected between the two ESP32 boards?")
+- Identify instruments ("What instruments are on the bench?")
+- Check probe placement ("Is the scope probe on the 3V3 rail?")
+- Diagnose physical issues ("Why might the ESP32 not be powering on?")
+The phone must be streaming video via the Flutter app.`,
+          inputSchema: z.object({
+            prompt: z
+              .string()
+              .describe(
+                "What to look for / analyze in the camera image. Be specific."
+              ),
+          }),
+          execute: async ({ prompt }) => {
+            const res = await runnerCall("/camera/analyze", {
+              prompt,
+              model: "gemini-3.1-flash-lite-preview",
+            });
+            if (res.artifact_url) {
+              res.image_url = `${RUNNER_URL}${res.artifact_url}`;
+            }
+            return res;
+          },
+        }),
+
+        camera_status: tool({
+          description:
+            "Check if the phone camera is connected and streaming frames.",
+          inputSchema: z.object({}),
+          execute: async () => {
+            return await runnerCall("/camera/status");
+          },
+        }),
       },
-      stopWhen: stepCountIs(15),
+      maxSteps: 15,
     });
 
     return NextResponse.json({
