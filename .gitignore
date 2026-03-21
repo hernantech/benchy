@@ -1,0 +1,36 @@
+# ── OS ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── PlatformIO (firmware/) ──────────────────────────────────────
+.pio/
+.vscode/
+
+# ── Node / Next.js (web/) ───────────────────────────────────────
+node_modules/
+.next/
+out/
+.vercel/
+.env
+.env.*
+!.env.example
+
+# ── Python (runner/) ────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# ── Editor / IDE ────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.idea/
+
+# ── Build artifacts ─────────────────────────────────────────────
+dist/
+build/
+*.bin
+*.elf
+*.map
