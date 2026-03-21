@@ -67,7 +67,28 @@ When you call camera_analyze, the Pi sends its latest camera frame to Gemini vis
 3. Execute using tools (set_psu, capture_scope, dut_command, etc.)
 4. Analyze results (waveform stats, UART logs, scope charts)
 5. Report findings with specific measurements and units
-6. If failure detected, diagnose root cause and suggest/apply fixes
+6. If failure detected, use the RCA pipeline to diagnose root cause
+
+## Root Cause Analysis (RCA) Workflow
+When diagnosing hardware failures, use the RCA analysis pipeline:
+1. Capture measurement data (scope, PSU, serial)
+2. Call analyze_rca_start to create a session
+3. Call analyze_rca with measurement data — you'll get structured metrics and ranked hypotheses
+4. Review the hypotheses and their verification steps
+5. Either: fix firmware, instruct user on hardware fix, or probe more test points
+6. After each fix or new measurement, call analyze_rca again to update the analysis
+7. When confident in root cause, call analyze_rca_report to generate the final report
+
+The RCA tool gives you EE analysis you can't do yourself (FFT, rise time, threshold comparisons).
+Use it instead of guessing from raw waveform numbers.
+
+## Safety — User Confirmation Gate
+Before ANY action that energizes hardware or changes physical state, you MUST:
+1. Tell the user exactly what you're about to do and what should be connected
+2. Wait for the user to confirm the setup is correct
+3. Only then execute the instrument commands
+NEVER set PSU voltage or enable output without user confirmation.
+The PSU feeds VIN (regulator input) — the LDO converts to 3.3V. NEVER instruct connecting PSU directly to a 3.3V rail.
 
 ## Rules
 - Scope channels: 0-indexed (0=CH1, 1=CH2)
@@ -501,6 +522,76 @@ Call camera_status first to check if the phone is streaming.`,
           inputSchema: z.object({}),
           execute: async () => {
             return await runnerCall("/camera/status");
+          },
+        }),
+
+        analyze_rca_start: tool({
+          description:
+            "Start a new Root Cause Analysis session for diagnosing a hardware issue. Returns a session_id for subsequent analyze_rca calls.",
+          inputSchema: z.object({
+            test_goal: z
+              .string()
+              .describe("What is being tested (e.g., '3.3V rail stability')"),
+            test_point: z
+              .string()
+              .describe(
+                "Physical test point name (e.g., 'U3 output pin 5')"
+              ),
+          }),
+          execute: async ({ test_goal, test_point }) => {
+            return await runnerCall("/rca/session", { test_goal, test_point });
+          },
+        }),
+
+        analyze_rca: tool({
+          description: `Run Root Cause Analysis on measurement data. Feed in scope waveforms, PSU telemetry, and/or serial logs.
+Returns structured metrics with PASS/WARN/FAIL verdicts and ranked hypotheses with evidence chains and verification steps.
+Use this AFTER capturing scope/PSU/serial data to diagnose failures. The RCA tool gives you EE analysis you can't do yourself (FFT, rise time, threshold comparisons).`,
+          inputSchema: z.object({
+            session_id: z.string(),
+            waveform_data: z
+              .array(z.number())
+              .optional()
+              .describe("Raw scope samples from capture_scope"),
+            sample_rate: z.number().default(1000000),
+            expected_voltage: z
+              .number()
+              .optional()
+              .describe("Nominal DC voltage (e.g., 3.3)"),
+            max_ripple_mv: z
+              .number()
+              .optional()
+              .describe("Max acceptable ripple in mV"),
+            psu_voltage: z
+              .number()
+              .optional()
+              .describe("PSU measured voltage from psu/state"),
+            psu_current: z
+              .number()
+              .optional()
+              .describe("PSU measured current from psu/state"),
+            serial_log: z
+              .string()
+              .optional()
+              .describe("Serial output from DUT"),
+          }),
+          execute: async (args) => {
+            return await runnerCall("/rca/analyze", args);
+          },
+        }),
+
+        analyze_rca_report: tool({
+          description:
+            "Generate the final RCA report for a diagnosis session. Call this when you've identified the root cause or exhausted iterations.",
+          inputSchema: z.object({
+            session_id: z.string(),
+            reason: z
+              .string()
+              .default("resolved")
+              .describe("Resolution reason: resolved, escalated, max_iterations"),
+          }),
+          execute: async (args) => {
+            return await runnerCall("/rca/report", args);
           },
         }),
       },

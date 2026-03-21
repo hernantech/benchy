@@ -1317,6 +1317,15 @@ async def firmware_compile(req: FirmwareCompileReq):
         raise HTTPException(500, str(e))
 
 
+# ── RCA Module ───────────────────────────────────────────────────
+try:
+    from rca.rca_endpoints import rca_router
+    app.include_router(rca_router, prefix="/rca")
+    log.info("RCA module loaded — /rca/* endpoints available")
+except ImportError:
+    log.warning("RCA module not found — /rca/* endpoints unavailable")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
