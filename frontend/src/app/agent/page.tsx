@@ -107,20 +107,53 @@ export default function AgentPage() {
               {/* Tool calls */}
               {msg.toolCalls && msg.toolCalls.length > 0 && (
                 <div className="mt-3 space-y-2">
-                  {msg.toolCalls.map((tc, j) => (
-                    <div
-                      key={j}
-                      className="bg-muted rounded-sm p-2 text-xs font-mono"
-                    >
-                      <div className="text-accent">{tc.name}</div>
-                      <div className="text-muted-foreground">
-                        {JSON.stringify(tc.args)}
+                  {msg.toolCalls.map((tc, j) => {
+                    // Extract image URLs from tool results
+                    const resultObj = tc.result && typeof tc.result === "object" ? tc.result as Record<string, unknown> : null;
+                    const resultStr = tc.result && typeof tc.result === "string" ? tc.result : null;
+                    let parsed: Record<string, unknown> | null = resultObj;
+                    if (!parsed && resultStr) {
+                      try { parsed = JSON.parse(resultStr); } catch { /* ignore */ }
+                    }
+                    const imageUrl = parsed?.image_url as string | undefined
+                      || parsed?.chart_full_url as string | undefined
+                      || (parsed?.scope as Record<string, unknown>)?.chart_full_url as string | undefined;
+
+                    return (
+                      <div
+                        key={j}
+                        className="bg-muted rounded-sm p-2 text-xs font-mono"
+                      >
+                        <div className="text-accent">{tc.name}</div>
+                        <div className="text-muted-foreground truncate max-w-full">
+                          {JSON.stringify(tc.args)}
+                        </div>
+                        {imageUrl && (
+                          <div className="mt-2">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={imageUrl}
+                              alt={`${tc.name} result`}
+                              className="rounded-md max-w-full max-h-80 border border-border"
+                            />
+                          </div>
+                        )}
+                        {tc.result && !imageUrl && (
+                          <div className="mt-1 text-foreground max-h-40 overflow-auto">
+                            {typeof tc.result === "string" ? tc.result : JSON.stringify(tc.result, null, 2)}
+                          </div>
+                        )}
+                        {tc.result && imageUrl && (
+                          <details className="mt-1">
+                            <summary className="text-muted-foreground cursor-pointer hover:text-foreground">Raw result</summary>
+                            <div className="mt-1 text-foreground max-h-40 overflow-auto">
+                              {typeof tc.result === "string" ? tc.result : JSON.stringify(tc.result, null, 2)}
+                            </div>
+                          </details>
+                        )}
                       </div>
-                      {tc.result && (
-                        <div className="mt-1 text-foreground">{tc.result}</div>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
