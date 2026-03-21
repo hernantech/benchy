@@ -53,12 +53,6 @@ export default function RootLayout({
             >
               Instruments
             </a>
-            <a
-              href="/agent"
-              className="text-muted-foreground hover:text-primary transition-colors"
-            >
-              Agent
-            </a>
           </div>
         </nav>
         <main className="flex-1 pt-14">{children}</main>
