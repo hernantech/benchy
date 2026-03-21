@@ -6,19 +6,19 @@ Controls: Analog Discovery (dwfpy), DPS-150 PSU, two ESP32-S3 boards.
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
 import time
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import serial
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── Constants ────────────────────────────────────────────────────
@@ -33,12 +33,12 @@ log = logging.getLogger("benchagent")
 
 # ── Global device handles ────────────────────────────────────────
 _ad2 = None       # DigilentDwfClient
-_psu = None       # DPS150Client
+_psu = None       # DPS150
 _esp: dict[str, serial.Serial] = {}  # "a" / "b" -> Serial
 
 
 def _find_esp32_ports() -> dict[str, str]:
-    """Find ESP32 serial ports. Returns {"a": "/dev/ttyACM0", "b": "/dev/ttyACM1"} etc."""
+    """Find ESP32 serial ports by querying status. Returns {"a": "/dev/...", "b": "/dev/..."}."""
     import glob
     ports = sorted(glob.glob("/dev/ttyACM*"))
     result = {}
@@ -54,7 +54,6 @@ def _find_esp32_ports() -> dict[str, str]:
                 resp += ser.readline()
             ser.close()
             text = resp.decode("utf-8", errors="replace").strip()
-            # Find the JSON line
             for line in text.split("\n"):
                 line = line.strip()
                 if line.startswith("{"):
@@ -71,7 +70,6 @@ def _find_esp32_ports() -> dict[str, str]:
 
 
 def _connect_esp32s():
-    """Connect to ESP32 boards."""
     global _esp
     ports = _find_esp32_ports()
     for name, port in ports.items():
@@ -86,20 +84,20 @@ def _connect_esp32s():
 
 
 def _connect_psu():
-    """Connect to DPS-150 PSU."""
+    """Connect to DPS-150 PSU using the dps150 library."""
     global _psu
     try:
-        from galois_edge.sdk_wrappers.dps150_wrapper import DPS150Client
-        _psu = DPS150Client()
-        _psu.connect()
-        log.info("DPS-150 connected")
+        from dps150 import DPS150
+        _psu = DPS150()
+        _psu.open()
+        log.info("DPS-150 connected: %s (fw %s)", _psu.model_name, _psu.firmware_version)
     except Exception as e:
         log.warning("DPS-150 not available: %s", e)
         _psu = None
 
 
 def _connect_ad2():
-    """Connect to Analog Discovery."""
+    """Connect to Analog Discovery using the daemon-clean wrapper."""
     global _ad2
     try:
         from galois_edge.sdk_wrappers.digilent_dwf_wrapper import DigilentDwfClient
@@ -119,16 +117,15 @@ async def lifespan(app: FastAPI):
     _connect_psu()
     _connect_esp32s()
     yield
-    # Cleanup
-    for name, ser in _esp.items():
+    for ser in _esp.values():
         try:
             ser.close()
         except Exception:
             pass
     if _psu:
         try:
-            _psu.disable_output()
-            _psu.disconnect()
+            _psu.disable()
+            _psu.close()
         except Exception:
             pass
     if _ad2:
@@ -199,7 +196,6 @@ def _render_chart(
         spine.set_color("#444")
 
     if annotations:
-        y_range = max(data) - min(data) if data else 1
         text_parts = []
         for k, v in annotations.items():
             if isinstance(v, float):
@@ -218,6 +214,19 @@ def _render_chart(
     fig.savefig(fpath, dpi=100, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return fname
+
+
+def _psu_state_dict(psu) -> dict:
+    """Read current PSU state as a dict."""
+    return {
+        "output_voltage": psu.output_voltage or 0,
+        "output_current": psu.output_current or 0,
+        "output_power": psu.output_power or 0,
+        "mode": psu.mode or "CV",
+        "temperature": psu.temperature or 0,
+        "protection_state": psu.protection_state or "",
+        "output_enabled": psu.output_closed or False,
+    }
 
 
 # ── Pydantic models ──────────────────────────────────────────────
@@ -308,6 +317,188 @@ class DebugRunReq(BaseModel):
     reset_before: bool = True
 
 
+class BenchmarkRunReq(BaseModel):
+    kernel: str = "baseline"
+    iterations: int = 1000
+    scope_channel: int = 0
+    scope_trigger_level: float = 1.5
+    measure_power: bool = True
+
+
+# ── Capabilities (tool discovery for the LLM agent) ─────────────
+CAPABILITIES = {
+    "bench_id": "benchagent-pi",
+    "description": "BenchCI hardware test bench — RPi 5 controlling lab instruments for automated hardware testing",
+    "tools": [
+        {
+            "name": "psu_configure",
+            "endpoint": "POST /psu/configure",
+            "description": "Set DPS-150 power supply voltage and current limit. Enables/disables output.",
+            "parameters": {
+                "voltage": {"type": "number", "unit": "V", "min": 0, "max": 5.5, "required": True},
+                "current_limit": {"type": "number", "unit": "A", "min": 0, "max": 1.0, "default": 0.5},
+                "output": {"type": "boolean", "default": True, "description": "Enable output"},
+            },
+        },
+        {
+            "name": "psu_state",
+            "endpoint": "GET /psu/state",
+            "description": "Read live PSU telemetry: voltage, current, power, temperature, mode, protection state.",
+            "parameters": {},
+        },
+        {
+            "name": "psu_sweep",
+            "endpoint": "POST /psu/sweep",
+            "description": "Sweep voltage from start to stop, measuring at each step. Find brownout thresholds.",
+            "parameters": {
+                "start": {"type": "number", "unit": "V", "required": True},
+                "stop": {"type": "number", "unit": "V", "required": True},
+                "step": {"type": "number", "unit": "V", "required": True},
+                "dwell": {"type": "number", "unit": "s", "default": 0.5},
+            },
+        },
+        {
+            "name": "psu_off",
+            "endpoint": "POST /psu/off",
+            "description": "Immediately disable PSU output (safety).",
+            "parameters": {},
+        },
+        {
+            "name": "scope_capture",
+            "endpoint": "POST /scope/capture",
+            "description": "Oscilloscope single-shot capture. Returns waveform data, stats (Vmin/Vmax/Vpp/Vrms), and rendered chart PNG.",
+            "parameters": {
+                "channel": {"type": "integer", "min": 0, "max": 1, "default": 0, "description": "0=CH1, 1=CH2"},
+                "v_range": {"type": "number", "unit": "V", "default": 5.0},
+                "samples": {"type": "integer", "default": 8192},
+                "sample_rate": {"type": "number", "unit": "Hz", "default": 1000000},
+                "trigger_level": {"type": "number", "unit": "V", "default": 1.5},
+                "trigger_channel": {"type": "integer", "default": -1, "description": "-1 = auto trigger"},
+                "offset": {"type": "number", "unit": "V", "default": 0.0},
+            },
+        },
+        {
+            "name": "scope_measure",
+            "endpoint": "POST /scope/measure",
+            "description": "Quick scalar measurement without full capture.",
+            "parameters": {
+                "channel": {"type": "integer", "default": 0},
+                "measurement": {"type": "enum", "values": ["dc", "peak_to_peak", "rms", "frequency"], "required": True},
+                "v_range": {"type": "number", "unit": "V", "default": 5.0},
+            },
+        },
+        {
+            "name": "scope_pulse_width",
+            "endpoint": "POST /scope/pulse_width",
+            "description": "Capture and measure a GPIO timing pulse width. Used for benchmarking execution time.",
+            "parameters": {
+                "channel": {"type": "integer", "default": 0},
+                "trigger_level": {"type": "number", "unit": "V", "default": 1.5},
+                "v_range": {"type": "number", "unit": "V", "default": 5.0},
+                "sample_rate": {"type": "number", "unit": "Hz", "default": 10000000},
+            },
+        },
+        {
+            "name": "scope_signal_integrity",
+            "endpoint": "POST /scope/signal_integrity",
+            "description": "Analyze signal integrity: rise/fall time (ns), overshoot/undershoot (%). Use 10MHz+ sample rate.",
+            "parameters": {
+                "channel": {"type": "integer", "default": 0},
+                "samples": {"type": "integer", "default": 8192},
+                "sample_rate": {"type": "number", "unit": "Hz", "default": 10000000},
+                "v_range": {"type": "number", "unit": "V", "default": 5.0},
+            },
+        },
+        {
+            "name": "uart_capture",
+            "endpoint": "POST /uart/capture",
+            "description": "Capture UART data from a DIO pin using the Analog Discovery protocol decoder.",
+            "parameters": {
+                "rx_pin": {"type": "integer", "default": 0, "description": "AD2 DIO pin number for UART RX"},
+                "baud": {"type": "integer", "default": 115200},
+                "duration_ms": {"type": "integer", "default": 3000},
+            },
+        },
+        {
+            "name": "i2c_capture",
+            "endpoint": "POST /i2c/capture",
+            "description": "Capture I2C bus traffic using the Analog Discovery protocol decoder.",
+            "parameters": {
+                "sda_pin": {"type": "integer", "default": 0, "description": "AD2 DIO pin for SDA"},
+                "scl_pin": {"type": "integer", "default": 1, "description": "AD2 DIO pin for SCL"},
+                "duration_ms": {"type": "integer", "default": 1000},
+            },
+        },
+        {
+            "name": "esp32_dut_command",
+            "endpoint": "POST /esp32/a/serial/send",
+            "description": "Send a JSON command to ESP32-S3 DUT board. Supports: pwm, i2c_init/scan/write/read, uart_init/send/recv, can_init/send/recv, gpio_mode/write/read, adc_read, wifi_connect/disconnect, status, ping, reset.",
+            "parameters": {
+                "command": {"type": "string", "required": True, "description": "JSON command string, e.g. {\"cmd\":\"pwm\",\"pin\":4,\"freq\":1000,\"duty\":50}"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+            },
+        },
+        {
+            "name": "esp32_fixture_command",
+            "endpoint": "POST /esp32/b/serial/send",
+            "description": "Send a JSON command to ESP32-S3 fixture board. Supports: i2c_slave_init/set_resp/set_mode/log, reset_dut, load (PWM→MOSFET), can_init/send/recv, gpio, adc, status.",
+            "parameters": {
+                "command": {"type": "string", "required": True, "description": "JSON command string"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+            },
+        },
+        {
+            "name": "esp32_reset",
+            "endpoint": "POST /esp32/{board}/reset",
+            "description": "Reset an ESP32 board. Board A reset via fixture GPIO (EN pin), Board B via DTR.",
+            "parameters": {
+                "board": {"type": "enum", "values": ["a", "b"], "required": True},
+            },
+        },
+        {
+            "name": "run_debug",
+            "endpoint": "POST /run/debug",
+            "description": "Full debug cycle: configure PSU → reset DUT → capture scope + UART simultaneously → detect brownout. Returns PSU state, scope stats + chart, UART log, brownout flag.",
+            "parameters": {
+                "psu_voltage": {"type": "number", "unit": "V", "default": 3.3},
+                "psu_current_limit": {"type": "number", "unit": "A", "default": 0.15},
+                "scope_channel": {"type": "integer", "default": 0},
+                "capture_duration_ms": {"type": "integer", "default": 3000},
+                "reset_before": {"type": "boolean", "default": True},
+            },
+        },
+        {
+            "name": "run_benchmark",
+            "endpoint": "POST /run/benchmark",
+            "description": "Run firmware benchmark: send kernel to ESP32, capture timing pulse on scope, measure power via PSU. Returns execution time, per-iteration timing, power consumption.",
+            "parameters": {
+                "kernel": {"type": "string", "required": True},
+                "iterations": {"type": "integer", "default": 1000},
+                "scope_channel": {"type": "integer", "default": 0},
+                "scope_trigger_level": {"type": "number", "default": 1.5},
+                "measure_power": {"type": "boolean", "default": True},
+            },
+        },
+    ],
+}
+
+
+@app.get("/capabilities")
+async def capabilities():
+    """Return structured tool catalog for LLM agent discovery."""
+    # Merge static capability definitions with live device status
+    health = {}
+    if _ad2:
+        health["ad2"] = True
+    if _psu:
+        health["psu"] = True
+    for name in ("a", "b"):
+        if name in _esp and _esp[name].is_open:
+            health[f"esp32_{name}"] = True
+
+    return {**CAPABILITIES, "connected_devices": health}
+
+
 # ── Health ───────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -325,8 +516,8 @@ async def health():
         try:
             devices["psu"] = {
                 "connected": True,
-                "model": "DPS-150",
-                "input_voltage": float(_psu.get_input_voltage()),
+                "model": _psu.model_name or "DPS-150",
+                "input_voltage": _psu.output_voltage,
             }
         except Exception:
             devices["psu"] = {"connected": False}
@@ -355,9 +546,10 @@ async def psu_configure(req: PsuConfigureReq):
         psu.set_voltage(req.voltage)
         psu.set_current(req.current_limit)
         if req.output:
-            psu.enable_output()
+            psu.enable()
         else:
-            psu.disable_output()
+            psu.disable()
+        time.sleep(0.2)  # let telemetry update
         return {
             "ok": True,
             "voltage_setpoint": req.voltage,
@@ -365,7 +557,10 @@ async def psu_configure(req: PsuConfigureReq):
             "output_enabled": req.output,
         }
     except Exception as e:
-        psu.disable_output()
+        try:
+            psu.disable()
+        except Exception:
+            pass
         raise HTTPException(500, str(e))
 
 
@@ -373,16 +568,9 @@ async def psu_configure(req: PsuConfigureReq):
 async def psu_state():
     psu = _require_psu()
     try:
-        state = json.loads(psu.get_state())
-        return {
-            "output_voltage": state.get("output_voltage", 0),
-            "output_current": state.get("output_current", 0),
-            "output_power": state.get("output_power", 0),
-            "mode": state.get("mode", "CV"),
-            "temperature": state.get("temperature", 0),
-            "protection_state": state.get("protection_state", ""),
-            "output_enabled": state.get("output_closed", False),
-        }
+        psu.get_all()
+        time.sleep(0.15)
+        return _psu_state_dict(psu)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -393,17 +581,30 @@ async def psu_sweep(req: PsuSweepReq):
     if max(abs(req.start), abs(req.stop)) > PSU_MAX_VOLTAGE:
         raise HTTPException(400, f"Sweep voltage exceeds safety limit {PSU_MAX_VOLTAGE}V")
     try:
-        result = json.loads(psu.sweep_voltage(req.start, req.stop, abs(req.step), req.dwell))
+        psu.enable()
+        points = psu.sweep_voltage(req.start, req.stop, abs(req.step), dwell=req.dwell)
+        result = []
+        for pt in points:
+            result.append({
+                "voltage_set": pt.voltage_set,
+                "voltage_meas": pt.voltage_measured,
+                "current": pt.current,
+                "power": pt.power,
+                "temp": pt.temperature,
+            })
         return {"points": result}
     except Exception as e:
-        psu.disable_output()
+        try:
+            psu.disable()
+        except Exception:
+            pass
         raise HTTPException(500, str(e))
 
 
 @app.post("/psu/off")
 async def psu_off():
     psu = _require_psu()
-    psu.disable_output()
+    psu.disable()
     return {"ok": True}
 
 
@@ -436,7 +637,7 @@ async def scope_capture(req: ScopeCaptureReq):
             annotations=stats,
         )
         return {
-            "data": data,
+            "data": data[:500] if len(data) > 500 else data,  # truncate for JSON size
             "sample_rate": req.sample_rate,
             "sample_count": len(data),
             "stats": stats,
@@ -452,17 +653,17 @@ async def scope_capture(req: ScopeCaptureReq):
 async def scope_measure(req: ScopeMeasureReq):
     ad2 = _require_ad2()
     try:
-        if req.measurement == "dc":
-            val = float(ad2.scope_measure_dc(req.channel, req.v_range))
-        elif req.measurement == "peak_to_peak":
-            val = float(ad2.scope_measure_peak_to_peak(req.channel, req.v_range))
-        elif req.measurement == "rms":
-            val = float(ad2.scope_measure_rms(req.channel, req.v_range))
-        elif req.measurement == "frequency":
-            val = float(ad2.scope_measure_frequency(req.channel, req.v_range))
-        else:
+        measure_fn = {
+            "dc": ad2.scope_measure_dc,
+            "peak_to_peak": ad2.scope_measure_peak_to_peak,
+            "rms": ad2.scope_measure_rms,
+            "frequency": ad2.scope_measure_frequency,
+        }.get(req.measurement)
+        if not measure_fn:
             raise HTTPException(400, f"Unknown measurement: {req.measurement}")
-        return {"channel": req.channel, "measurement": req.measurement, "value": val, "unit": "V"}
+        val = float(measure_fn(req.channel, req.v_range))
+        unit = "Hz" if req.measurement == "frequency" else "V"
+        return {"channel": req.channel, "measurement": req.measurement, "value": val, "unit": unit}
     except HTTPException:
         raise
     except Exception as e:
@@ -529,7 +730,6 @@ async def scope_signal_integrity(req: SignalIntegrityReq):
         arr = np.array(data)
         dt = 1.0 / req.sample_rate
 
-        # Rise/fall time (10%-90%)
         v_min, v_max = float(arr.min()), float(arr.max())
         v_range = v_max - v_min
         if v_range < 0.01:
@@ -538,40 +738,31 @@ async def scope_signal_integrity(req: SignalIntegrityReq):
         lo = v_min + 0.1 * v_range
         hi = v_min + 0.9 * v_range
 
-        # Find first rising edge
-        rise_ns = 0
+        rise_ns = 0.0
         for i in range(1, len(arr)):
-            if arr[i - 1] <= lo and arr[i] > lo:
-                start = i
+            if arr[i - 1] <= lo < arr[i]:
                 for j in range(i, len(arr)):
                     if arr[j] >= hi:
-                        rise_ns = (j - start) * dt * 1e9
+                        rise_ns = (j - i) * dt * 1e9
                         break
                 break
 
-        # Find first falling edge
-        fall_ns = 0
+        fall_ns = 0.0
         for i in range(1, len(arr)):
-            if arr[i - 1] >= hi and arr[i] < hi:
-                start = i
+            if arr[i - 1] >= hi > arr[i]:
                 for j in range(i, len(arr)):
                     if arr[j] <= lo:
-                        fall_ns = (j - start) * dt * 1e9
+                        fall_ns = (j - i) * dt * 1e9
                         break
                 break
 
-        # Overshoot/undershoot
-        overshoot_pct = max(0, (v_max - hi) / v_range * 100) if v_range > 0 else 0
-        undershoot_pct = max(0, (lo - v_min) / v_range * 100) if v_range > 0 else 0
+        overshoot_pct = max(0, (v_max - hi) / v_range * 100)
+        undershoot_pct = max(0, (lo - v_min) / v_range * 100)
 
         fname = _render_chart(
             data, req.sample_rate,
             title="Signal Integrity",
-            annotations={
-                "rise_ns": rise_ns,
-                "fall_ns": fall_ns,
-                "overshoot_%": overshoot_pct,
-            },
+            annotations={"rise_ns": rise_ns, "fall_ns": fall_ns, "overshoot_%": overshoot_pct},
         )
         return {
             "rise_time_ns": rise_ns,
@@ -608,8 +799,6 @@ async def i2c_capture(req: I2cCaptureReq):
     ad2 = _require_ad2()
     try:
         ad2.i2c_setup(pin_scl=req.scl_pin, pin_sda=req.sda_pin)
-        # I2C capture via logic analyzer is complex — return placeholder
-        # The AD2 protocol decoder captures in real-time during the duration
         time.sleep(req.duration_ms / 1000)
         return {"transactions": [], "bus_errors": 0, "note": "I2C capture requires active bus traffic"}
     except HTTPException:
@@ -623,10 +812,9 @@ async def i2c_capture(req: I2cCaptureReq):
 async def esp32_serial_send(board: str, req: EspSerialSendReq):
     ser = _require_esp(board)
     try:
-        cmd = json.loads(req.command) if req.command.startswith("{") else {"cmd": req.command}
+        cmd = json.loads(req.command) if req.command.strip().startswith("{") else {"cmd": req.command}
         return {"response": _esp_cmd(ser, cmd, req.timeout_ms)}
     except json.JSONDecodeError:
-        # Send raw string
         ser.reset_input_buffer()
         ser.write((req.command + "\n").encode())
         time.sleep(0.5)
@@ -660,11 +848,9 @@ async def esp32_serial_read(board: str, req: EspSerialReadReq):
 async def esp32_reset(board: str):
     ser = _require_esp(board)
     if board == "a" and "b" in _esp:
-        # Reset DUT via fixture's GPIO
         _esp_cmd(_esp["b"], {"cmd": "reset_dut", "hold_ms": 100})
         return {"ok": True, "method": "gpio_en_pin"}
     else:
-        # Reset via DTR toggle
         ser.dtr = False
         time.sleep(0.1)
         ser.dtr = True
@@ -689,7 +875,6 @@ async def esp32_flash(board: str, req: EspFlashReq):
         build_time = time.time() - start
         if result.returncode != 0:
             raise HTTPException(500, f"Flash failed: {result.stderr[-500:]}")
-        # Reopen serial
         time.sleep(2)
         _esp[board] = serial.Serial(port, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
         time.sleep(1)
@@ -698,7 +883,6 @@ async def esp32_flash(board: str, req: EspFlashReq):
     except HTTPException:
         raise
     except Exception as e:
-        # Try to reopen
         try:
             _esp[board] = serial.Serial(port, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
         except Exception:
@@ -715,19 +899,21 @@ async def get_artifact(filename: str):
     return FileResponse(fpath)
 
 
-# ── Compound Operations ─────────────────────────────────────────
+# ── Compound: Debug Run ──────────────────────────────────────────
 @app.post("/run/debug")
 async def run_debug(req: DebugRunReq):
     psu = _require_psu()
     ad2 = _require_ad2()
 
     try:
-        # Configure PSU
+        # Safety check
         if req.psu_voltage > PSU_MAX_VOLTAGE:
             raise HTTPException(400, f"Voltage exceeds safety limit {PSU_MAX_VOLTAGE}V")
+
+        # Configure PSU
         psu.set_voltage(req.psu_voltage)
         psu.set_current(req.psu_current_limit)
-        psu.enable_output()
+        psu.enable()
         time.sleep(0.3)
 
         # Reset DUT if requested
@@ -738,12 +924,31 @@ async def run_debug(req: DebugRunReq):
                 _esp["a"].dtr = False
                 time.sleep(0.1)
                 _esp["a"].dtr = True
-            time.sleep(0.5)
+            time.sleep(0.3)
 
-        # Start UART capture
-        ad2.uart_setup(pin_rx=req.uart_rx_pin, baud=req.uart_baud)
+        # Start UART capture and scope capture concurrently
+        uart_text = ""
+        uart_bytes = 0
 
-        # Scope capture
+        def _capture_uart():
+            nonlocal uart_text, uart_bytes
+            try:
+                ad2.uart_setup(pin_rx=req.uart_rx_pin, baud=req.uart_baud)
+                time.sleep(req.capture_duration_ms / 1000)
+                result = json.loads(ad2.uart_read())
+                hex_data = result.get("data", "")
+                uart_text = bytes.fromhex(hex_data).decode("utf-8", errors="replace") if hex_data else ""
+                uart_bytes = len(hex_data) // 2
+            except Exception as e:
+                uart_text = f"[UART capture error: {e}]"
+
+        # Run UART capture in a thread while we do the scope capture
+        # Note: AD2 can do scope + UART simultaneously on different subsystems
+        uart_thread = threading.Thread(target=_capture_uart)
+        uart_thread.start()
+
+        # Give UART a moment to start, then capture scope
+        time.sleep(0.2)
         raw = ad2.scope_acquire(
             channel=req.scope_channel,
             v_range=req.scope_v_range,
@@ -761,14 +966,12 @@ async def run_debug(req: DebugRunReq):
             "v_mean": float(arr.mean()),
         }
 
-        # Wait for UART data
-        remaining = max(0, req.capture_duration_ms / 1000 - 0.5)
-        if remaining > 0:
-            time.sleep(remaining)
+        # Wait for UART thread
+        uart_thread.join(timeout=req.capture_duration_ms / 1000 + 2)
 
-        uart_result = json.loads(ad2.uart_read())
-        hex_data = uart_result.get("data", "")
-        uart_text = bytes.fromhex(hex_data).decode("utf-8", errors="replace") if hex_data else ""
+        # PSU state
+        psu.get_all()
+        time.sleep(0.15)
 
         # Render chart
         fname = _render_chart(
@@ -780,18 +983,15 @@ async def run_debug(req: DebugRunReq):
         brownout = "brownout" in uart_text.lower() or stats["v_min"] < 2.7
 
         return {
-            "psu": {
-                "voltage": float(psu.get_output_voltage()),
-                "current": float(psu.get_output_current()),
-                "mode": psu.get_operating_mode(),
-            },
+            "psu": _psu_state_dict(psu),
             "scope": {
                 "stats": stats,
+                "data": scope_data[:500] if len(scope_data) > 500 else scope_data,
                 "chart_url": f"/artifacts/{fname}",
             },
             "uart": {
                 "data": uart_text,
-                "bytes": len(hex_data) // 2,
+                "bytes": uart_bytes,
             },
             "brownout_detected": brownout,
         }
@@ -799,9 +999,102 @@ async def run_debug(req: DebugRunReq):
         raise
     except Exception as e:
         try:
-            psu.disable_output()
+            psu.disable()
         except Exception:
             pass
+        raise HTTPException(500, str(e))
+
+
+# ── Compound: Benchmark Run ──────────────────────────────────────
+@app.post("/run/benchmark")
+async def run_benchmark(req: BenchmarkRunReq):
+    """Run a benchmark kernel on the DUT and measure execution time + power."""
+    ad2 = _require_ad2()
+    dut = _require_esp("a")
+
+    try:
+        # Tell ESP32 to run the kernel — it should toggle a GPIO pin during execution
+        cmd = {"cmd": "benchmark", "kernel": req.kernel, "iterations": req.iterations}
+        dut.reset_input_buffer()
+        dut.write((json.dumps(cmd) + "\n").encode())
+
+        # Small delay for ESP32 to set up, then capture the timing pulse
+        time.sleep(0.1)
+
+        raw = ad2.scope_acquire(
+            channel=req.scope_channel,
+            v_range=5.0,
+            samples=8192,
+            sample_rate=10_000_000,
+            trigger_level=req.scope_trigger_level,
+            trigger_channel=req.scope_channel,
+        )
+        data = json.loads(raw)
+        arr = np.array(data)
+
+        # Measure pulse width
+        threshold = req.scope_trigger_level
+        above = arr > threshold
+        transitions = np.diff(above.astype(int))
+        rising = np.where(transitions == 1)[0]
+        falling = np.where(transitions == -1)[0]
+
+        pulse_width_s = 0.0
+        if len(rising) > 0 and len(falling) > 0:
+            start_idx = rising[0]
+            end_candidates = falling[falling > start_idx]
+            if len(end_candidates) > 0:
+                end_idx = end_candidates[0]
+                pulse_width_s = (end_idx - start_idx) / 10_000_000
+
+        total_ms = pulse_width_s * 1000
+        per_iter_us = (pulse_width_s * 1_000_000) / max(req.iterations, 1)
+
+        # Read ESP32's own timing report
+        esp_report = {}
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if dut.in_waiting:
+                line = dut.readline().decode("utf-8", errors="replace").strip()
+                if line.startswith("{"):
+                    esp_report = json.loads(line)
+                    break
+            time.sleep(0.01)
+
+        # Power measurement
+        power_data = {}
+        if req.measure_power and _psu:
+            _psu.get_all()
+            time.sleep(0.15)
+            avg_current_ma = (_psu.output_current or 0) * 1000
+            avg_power_mw = (_psu.output_power or 0) * 1000
+            energy_per_iter_uj = (avg_power_mw * per_iter_us) / 1000 if per_iter_us > 0 else 0
+            power_data = {
+                "avg_current_ma": round(avg_current_ma, 2),
+                "avg_power_mw": round(avg_power_mw, 2),
+                "energy_per_iter_uj": round(energy_per_iter_uj, 3),
+            }
+
+        fname = _render_chart(
+            data, 10_000_000,
+            title=f"Benchmark: {req.kernel} ({req.iterations} iters)",
+            annotations={"pulse_ms": total_ms, "per_iter_us": per_iter_us},
+        )
+
+        return {
+            "kernel": req.kernel,
+            "iterations": req.iterations,
+            "execution": {
+                "total_ms": round(total_ms, 3),
+                "per_iteration_us": round(per_iter_us, 3),
+                "chart_url": f"/artifacts/{fname}",
+            },
+            "power": power_data,
+            "esp32_report": esp_report,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(500, str(e))
 
 
