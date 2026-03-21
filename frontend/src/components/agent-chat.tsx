@@ -1,7 +1,20 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+  Cell,
+} from "recharts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,6 +114,194 @@ function formatResult(result: unknown): {
 }
 
 // ---------------------------------------------------------------------------
+// ResultChart — auto-detect and render charts from tool results
+// ---------------------------------------------------------------------------
+
+const CHART_COLORS = {
+  primary: "oklch(0.50 0.12 165)",   // accent/teal
+  secondary: "oklch(0.65 0.15 250)", // blue
+  warn: "oklch(0.75 0.15 75)",       // yellow
+  grid: "oklch(0.30 0.02 250)",      // subtle grid
+  text: "oklch(0.65 0.02 250)",      // axis text
+};
+
+/** Generate simulated PWM square wave data points */
+function generatePWMWaveform(freq: number, dutyPct: number, cycles: number = 4): { t: number; v: number }[] {
+  const period = 1 / freq;
+  const highTime = period * (dutyPct / 100);
+  const pointsPerCycle = 100;
+  const points: { t: number; v: number }[] = [];
+
+  for (let c = 0; c < cycles; c++) {
+    const offset = c * period;
+    // Rising edge
+    points.push({ t: (offset) * 1000, v: 0 });
+    points.push({ t: (offset) * 1000, v: 3.3 });
+    // High duration
+    points.push({ t: (offset + highTime) * 1000, v: 3.3 });
+    // Falling edge
+    points.push({ t: (offset + highTime) * 1000, v: 0 });
+    // Low duration
+    points.push({ t: (offset + period) * 1000, v: 0 });
+  }
+  return points;
+}
+
+/** Extract nested response object from tool result */
+function getResponseObj(result: unknown): Record<string, unknown> | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  // Some results nest under "response"
+  if (r.response && typeof r.response === "object") {
+    return r.response as Record<string, unknown>;
+  }
+  return r;
+}
+
+function ResultChart({ toolName, result }: { toolName: string; result: unknown }) {
+  const chart = useMemo(() => {
+    const resp = getResponseObj(result);
+    if (!resp) return null;
+
+    const cmd = resp.cmd as string | undefined;
+
+    // --- PWM: simulated waveform ---
+    if (cmd === "pwm" || toolName === "dut_command" && resp.duty_pct !== undefined) {
+      const freq = (resp.freq as number) || 1000;
+      const duty = (resp.duty_pct as number) || 50;
+      const pin = resp.pin as number;
+      const waveform = generatePWMWaveform(freq, duty);
+
+      return {
+        type: "pwm" as const,
+        title: `PWM — GPIO${pin} @ ${freq >= 1000 ? `${freq / 1000}kHz` : `${freq}Hz`}, ${duty}% duty`,
+        data: waveform,
+        freq,
+        duty,
+      };
+    }
+
+    // --- Scope capture: metrics bar chart ---
+    if (resp.stats && typeof resp.stats === "object") {
+      const stats = resp.stats as Record<string, number>;
+      const data = Object.entries(stats)
+        .filter(([, v]) => typeof v === "number")
+        .map(([k, v]) => ({
+          name: k.replace("v_", "V_").replace("_", " "),
+          value: Number(v.toFixed(4)),
+        }));
+      if (data.length > 0) {
+        return { type: "bar" as const, title: "Scope Capture Stats", data };
+      }
+    }
+
+    // --- Signal integrity: metrics bar ---
+    if (resp.rise_time_ns !== undefined || resp.overshoot_pct !== undefined) {
+      const data: { name: string; value: number; unit: string }[] = [];
+      if (resp.rise_time_ns !== undefined) data.push({ name: "Rise", value: resp.rise_time_ns as number, unit: "ns" });
+      if (resp.fall_time_ns !== undefined) data.push({ name: "Fall", value: resp.fall_time_ns as number, unit: "ns" });
+      if (resp.overshoot_pct !== undefined) data.push({ name: "Overshoot", value: resp.overshoot_pct as number, unit: "%" });
+      if (resp.undershoot_pct !== undefined) data.push({ name: "Undershoot", value: resp.undershoot_pct as number, unit: "%" });
+      if (data.length > 0) {
+        return { type: "bar" as const, title: "Signal Integrity", data };
+      }
+    }
+
+    // --- ADC read: bar chart of value ---
+    if (cmd === "adc_read" && resp.voltage !== undefined) {
+      const data = [
+        { name: "Voltage", value: resp.voltage as number },
+        ...(resp.raw !== undefined ? [{ name: "Raw", value: resp.raw as number }] : []),
+      ];
+      return { type: "bar" as const, title: `ADC Pin ${resp.pin}`, data };
+    }
+
+    // --- PSU state: voltage + current ---
+    if (resp.voltage !== undefined && resp.current !== undefined && (resp.power !== undefined || resp.temperature !== undefined)) {
+      const data: { name: string; value: number }[] = [
+        { name: "Voltage (V)", value: resp.voltage as number },
+        { name: "Current (A)", value: resp.current as number },
+      ];
+      if (resp.power !== undefined) data.push({ name: "Power (W)", value: resp.power as number });
+      return { type: "bar" as const, title: "PSU State", data };
+    }
+
+    // --- Sweep voltage: line chart ---
+    if (Array.isArray(resp.points) || Array.isArray(resp.data)) {
+      const points = (resp.points || resp.data) as Record<string, unknown>[];
+      if (points.length > 2 && points[0] && typeof points[0].voltage === "number") {
+        const data = points.map((p) => ({
+          voltage: (p.voltage as number).toFixed(2),
+          current: p.current as number,
+        }));
+        return { type: "line" as const, title: "Voltage Sweep", data, xKey: "voltage", yKey: "current" };
+      }
+    }
+
+    return null;
+  }, [toolName, result]);
+
+  if (!chart) return null;
+
+  return (
+    <div className="border-t border-border p-2">
+      <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1 px-1">
+        {chart.title}
+      </div>
+      <div className="h-32 w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          {chart.type === "pwm" ? (
+            <LineChart data={chart.data} margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+              <XAxis
+                dataKey="t"
+                tick={{ fontSize: 9, fill: CHART_COLORS.text }}
+                tickFormatter={(v) => `${Number(v).toFixed(1)}`}
+                label={{ value: "ms", position: "insideBottomRight", offset: -2, fontSize: 9, fill: CHART_COLORS.text }}
+              />
+              <YAxis
+                domain={[-0.3, 3.6]}
+                ticks={[0, 3.3]}
+                tick={{ fontSize: 9, fill: CHART_COLORS.text }}
+                tickFormatter={(v) => `${v}V`}
+                width={32}
+              />
+              <ReferenceLine y={3.3} stroke={CHART_COLORS.warn} strokeDasharray="3 3" strokeWidth={0.5} />
+              <Tooltip
+                contentStyle={{ fontSize: 10, background: "oklch(0.18 0.02 250)", border: "1px solid oklch(0.30 0.02 250)", borderRadius: 4 }}
+                labelFormatter={(v) => `${Number(v).toFixed(2)} ms`}
+                formatter={(v) => [`${Number(v).toFixed(1)} V`, "Voltage"]}
+              />
+              <Line type="stepAfter" dataKey="v" stroke={CHART_COLORS.primary} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </LineChart>
+          ) : chart.type === "line" ? (
+            <LineChart data={chart.data} margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+              <XAxis dataKey={chart.xKey} tick={{ fontSize: 9, fill: CHART_COLORS.text }} />
+              <YAxis tick={{ fontSize: 9, fill: CHART_COLORS.text }} width={40} />
+              <Tooltip contentStyle={{ fontSize: 10, background: "oklch(0.18 0.02 250)", border: "1px solid oklch(0.30 0.02 250)", borderRadius: 4 }} />
+              <Line type="monotone" dataKey={chart.yKey} stroke={CHART_COLORS.primary} strokeWidth={1.5} dot={{ r: 2 }} />
+            </LineChart>
+          ) : (
+            <BarChart data={chart.data} margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
+              <XAxis dataKey="name" tick={{ fontSize: 9, fill: CHART_COLORS.text }} />
+              <YAxis tick={{ fontSize: 9, fill: CHART_COLORS.text }} width={40} />
+              <Tooltip contentStyle={{ fontSize: 10, background: "oklch(0.18 0.02 250)", border: "1px solid oklch(0.30 0.02 250)", borderRadius: 4 }} />
+              <Bar dataKey="value" radius={[2, 2, 0, 0]}>
+                {chart.data.map((_: unknown, i: number) => (
+                  <Cell key={i} fill={i % 2 === 0 ? CHART_COLORS.primary : CHART_COLORS.secondary} />
+                ))}
+              </Bar>
+            </BarChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ToolCallBlock — individual tool step rendering
 // ---------------------------------------------------------------------------
 
@@ -172,7 +373,10 @@ function ToolCallBlock({ tc }: { tc: ToolCall }) {
         </div>
       )}
 
-      {/* Chart image */}
+      {/* Auto-generated chart from result data */}
+      {hasResult && <ResultChart toolName={tc.name} result={tc.result} />}
+
+      {/* Chart image from server (scope captures) */}
       {chartUrl && (
         <div className="border-t border-border p-2">
           {/* eslint-disable-next-line @next/next/no-img-element */}
