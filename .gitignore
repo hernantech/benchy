@@ -51,3 +51,4 @@ build/
 *.map
 supabase/.temp/
 firebase-debug.log
+.vercel

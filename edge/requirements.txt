@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets>=13,<14
+pyserial
+matplotlib
+numpy
+dwfpy>=1.1.0
+Pillow
+google-genai

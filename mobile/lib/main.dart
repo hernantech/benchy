@@ -5,7 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-const defaultWsUrl = 'ws://benchagent-pi:8420/camera/ws';
+const defaultWsUrl = 'ws://100.73.6.19:8420/camera/ws';
 const targetFps = 10;
 const jpegQuality = 70;
 

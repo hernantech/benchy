@@ -145,6 +145,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="BenchAgent", lifespan=lifespan)
 
+# Allow all origins — demo, Tailscale is the security boundary
+from starlette.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 # ── Helpers ──────────────────────────────────────────────────────
 def _require_psu():
