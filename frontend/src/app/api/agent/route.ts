@@ -595,19 +595,24 @@ Use this AFTER capturing scope/PSU/serial data to diagnose failures. The RCA too
           },
         }),
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      maxSteps: 15 as any,
-    } as any);
+      stopWhen: stepCountIs(15),
+    });
+
+    // Merge tool calls with their results from each step
+    const toolCalls = result.steps.flatMap((s) => {
+      const resultsMap = new Map(
+        (s.toolResults ?? []).map((tr: any) => [tr.toolCallId, tr.result])
+      );
+      return s.toolCalls.map((tc) => ({
+        name: tc.toolName,
+        args: "input" in tc ? tc.input : {},
+        result: resultsMap.get(tc.toolCallId),
+      }));
+    });
 
     return NextResponse.json({
       text: result.text,
-      toolCalls: result.steps
-        .flatMap((s) => s.toolCalls)
-        .map((tc) => ({
-          name: tc.toolName,
-          args: "input" in tc ? tc.input : {},
-          result: "result" in tc ? tc.result : undefined,
-        })),
+      toolCalls,
     });
   } catch (err) {
     console.error("[agent] error:", err);
