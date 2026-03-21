@@ -9,6 +9,8 @@ services:
       - ./frontend/.env
     environment:
       - PIPELINE_URL=http://pipeline:8002
+    extra_hosts:
+      - "benchagent-pi:100.73.6.19"
     logging:
       driver: json-file
       options:
@@ -27,7 +29,7 @@ services:
       - SUPABASE_URL=${SUPABASE_URL:-https://nkzomvuogwnynygaisjp.supabase.co}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY}
-      - RUNNER_URL=${RUNNER_URL:-http://benchagent-pi:8420}
+      - RUNNER_URL=${RUNNER_URL:-http://100.73.6.19:8420}
     logging:
       driver: json-file
       options:

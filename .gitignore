@@ -22,6 +22,21 @@ __pycache__/
 venv/
 *.egg-info/
 
+# ── Flutter / Dart (mobile/) ────────────────────────────────────
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/build/
+mobile/.packages
+mobile/ios/Pods/
+mobile/ios/Podfile.lock
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Flutter/flutter_export_environment.sh
+mobile/ios/Flutter/ephemeral/
+mobile/ios/Runner.xcworkspace/xcshareddata/
+*.iml
+
 # ── Editor / IDE ────────────────────────────────────────────────
 *.swp
 *.swo

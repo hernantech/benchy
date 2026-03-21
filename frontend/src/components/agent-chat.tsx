@@ -1,11 +1,18 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+
+interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result?: unknown;
+}
 
 interface Message {
   role: "user" | "assistant";
   content: string;
-  toolCalls?: { name: string; args: Record<string, unknown>; result?: string }[];
+  toolCalls?: ToolCall[];
 }
 
 const SUGGESTED_PROMPTS = [
@@ -14,6 +21,124 @@ const SUGGESTED_PROMPTS = [
   "Check I2C signal integrity between DUT and fixture at 400kHz",
   "Characterize the 3V3 rail ripple under WiFi load",
 ];
+
+// Format tool args as key=value pairs, one per line
+function formatArgs(args: Record<string, unknown>): string {
+  return Object.entries(args)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`)
+    .join("\n");
+}
+
+// Extract key fields from a tool result for compact display
+function formatResult(result: unknown): { summary: string; chartUrl?: string; detail?: string } {
+  if (result === undefined || result === null) return { summary: "no result" };
+  if (typeof result === "string") return { summary: result };
+  if (typeof result !== "object") return { summary: String(result) };
+
+  const r = result as Record<string, unknown>;
+  const lines: string[] = [];
+  let chartUrl: string | undefined;
+
+  // Pull out chart URLs
+  if (typeof r.chart_full_url === "string") chartUrl = r.chart_full_url;
+  else if (typeof r.chart_url === "string") chartUrl = r.chart_url as string;
+
+  // Check nested scope/execution objects for charts too
+  for (const nested of ["scope", "execution"] as const) {
+    const sub = r[nested] as Record<string, unknown> | undefined;
+    if (sub?.chart_full_url && typeof sub.chart_full_url === "string") {
+      chartUrl = sub.chart_full_url;
+    }
+  }
+
+  // Build summary from interesting fields
+  for (const [k, v] of Object.entries(r)) {
+    if (k === "chart_url" || k === "chart_full_url" || k === "ok") continue;
+    if (v === undefined || v === null) continue;
+    if (typeof v === "object" && !Array.isArray(v)) {
+      // Nested object — show one level
+      const sub = v as Record<string, unknown>;
+      const subLines = Object.entries(sub)
+        .filter(([sk]) => sk !== "chart_url" && sk !== "chart_full_url")
+        .map(([sk, sv]) => `  ${sk}: ${typeof sv === "object" ? JSON.stringify(sv) : sv}`);
+      if (subLines.length > 0) {
+        lines.push(`${k}:`);
+        lines.push(...subLines);
+      }
+    } else {
+      lines.push(`${k}: ${Array.isArray(v) ? JSON.stringify(v) : v}`);
+    }
+  }
+
+  const summary = lines.slice(0, 8).join("\n");
+  const detail = lines.length > 8 ? lines.join("\n") : undefined;
+
+  return { summary, chartUrl, detail };
+}
+
+function ToolCallBlock({ tc }: { tc: ToolCall }) {
+  const [expanded, setExpanded] = useState(false);
+  const { summary, chartUrl, detail } = formatResult(tc.result);
+  const hasResult = tc.result !== undefined;
+  const ok = typeof tc.result === "object" && tc.result !== null && (tc.result as Record<string, unknown>).ok === true;
+  const failed = typeof tc.result === "object" && tc.result !== null && (tc.result as Record<string, unknown>).ok === false;
+
+  return (
+    <div className="border border-border rounded-md overflow-hidden text-xs font-mono">
+      {/* Header */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 bg-muted hover:bg-surface-2 transition-colors text-left"
+      >
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+          !hasResult ? "bg-warning animate-pulse" : ok ? "bg-success" : failed ? "bg-destructive" : "bg-muted-foreground"
+        }`} />
+        <span className="text-accent font-medium">{tc.name}</span>
+        <span className="text-muted-foreground ml-auto">{expanded ? "▾" : "▸"}</span>
+      </button>
+
+      {/* Expanded content */}
+      {expanded && (
+        <div className="border-t border-border">
+          {/* Args */}
+          <div className="px-2.5 py-1.5 border-b border-border">
+            <div className="text-muted-foreground text-[10px] uppercase tracking-wide mb-0.5">input</div>
+            <pre className="text-foreground whitespace-pre-wrap">{formatArgs(tc.args)}</pre>
+          </div>
+
+          {/* Result */}
+          {hasResult && (
+            <div className="px-2.5 py-1.5">
+              <div className="text-muted-foreground text-[10px] uppercase tracking-wide mb-0.5">output</div>
+              <pre className="text-foreground whitespace-pre-wrap">{detail || summary}</pre>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Collapsed: show compact summary */}
+      {!expanded && hasResult && (
+        <div className="px-2.5 py-1 border-t border-border text-muted-foreground truncate">
+          {summary.split("\n")[0]}
+        </div>
+      )}
+
+      {/* Chart image */}
+      {chartUrl && (
+        <div className="border-t border-border p-2">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={chartUrl}
+            alt={`${tc.name} waveform`}
+            className="w-full rounded-sm"
+            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function AgentChat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -43,21 +168,24 @@ export function AgentChat() {
         }),
       });
 
-      if (!res.ok) throw new Error("Agent request failed");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null);
+        throw new Error(errData?.error || `Agent request failed (${res.status})`);
+      }
 
       const data = await res.json();
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: data.text || "No response",
+          content: data.text || "",
           toolCalls: data.toolCalls,
         },
       ]);
-    } catch {
+    } catch (err) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Error: Failed to reach agent." },
+        { role: "assistant", content: `Error: ${err instanceof Error ? err.message : "Failed to reach agent."}` },
       ]);
     } finally {
       setIsLoading(false);
@@ -74,8 +202,8 @@ export function AgentChat() {
               <div className="text-3xl mb-2 font-mono">&gt;_</div>
               <h2 className="text-sm font-semibold mb-1">Benchy Agent</h2>
               <p className="text-muted-foreground text-xs mb-4">
-                Tell the agent what to test. It will control the power supply,
-                oscilloscope, and ESP32 boards to run experiments.
+                Describe what to test. The agent controls real instruments
+                and reports measurements.
               </p>
               <div className="grid grid-cols-1 gap-1.5 text-left">
                 {SUGGESTED_PROMPTS.map((prompt) => (
@@ -93,47 +221,45 @@ export function AgentChat() {
         )}
 
         {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-          >
-            <div
-              className={`max-w-[85%] rounded-md px-3 py-2 ${
-                msg.role === "user"
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-card border border-border"
-              }`}
-            >
-              <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-
-              {msg.toolCalls && msg.toolCalls.length > 0 && (
-                <div className="mt-2 space-y-1.5">
-                  {msg.toolCalls.map((tc, j) => (
-                    <div
-                      key={j}
-                      className="bg-muted rounded-sm p-2 text-xs font-mono"
-                    >
-                      <div className="text-accent">{tc.name}</div>
-                      <div className="text-muted-foreground">
-                        {JSON.stringify(tc.args)}
-                      </div>
-                      {tc.result && (
-                        <div className="mt-1 text-foreground">{tc.result}</div>
-                      )}
-                    </div>
-                  ))}
+          <div key={i}>
+            {msg.role === "user" ? (
+              <div className="flex justify-end">
+                <div className="max-w-[85%] rounded-md px-3 py-2 bg-primary text-primary-foreground">
+                  <div className="text-sm prose prose-sm prose-neutral max-w-none [&_pre]:bg-muted [&_pre]:p-2 [&_pre]:rounded-sm [&_pre]:text-xs [&_pre]:font-mono [&_code]:text-xs [&_code]:font-mono [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-medium [&_table]:text-xs [&_th]:px-2 [&_th]:py-1 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-border [&_td]:border [&_td]:border-border">
+                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                  </div>
                 </div>
-              )}
-            </div>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {/* Tool calls — shown before text like Claude Code */}
+                {msg.toolCalls && msg.toolCalls.length > 0 && (
+                  <div className="space-y-1.5">
+                    {msg.toolCalls.map((tc, j) => (
+                      <ToolCallBlock key={j} tc={tc} />
+                    ))}
+                  </div>
+                )}
+
+                {/* Text response */}
+                {msg.content && (
+                  <div className="max-w-[85%] rounded-md px-3 py-2 bg-card border border-border">
+                    <div className="text-sm prose prose-sm prose-neutral max-w-none [&_pre]:bg-muted [&_pre]:p-2 [&_pre]:rounded-sm [&_pre]:text-xs [&_pre]:font-mono [&_code]:text-xs [&_code]:font-mono [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-medium [&_table]:text-xs [&_th]:px-2 [&_th]:py-1 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-border [&_td]:border [&_td]:border-border">
+                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                  </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ))}
 
         {isLoading && (
-          <div className="flex justify-start">
-            <div className="bg-card border border-border rounded-md px-3 py-2">
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <div className="w-2 h-2 bg-primary rounded-full animate-pulse" />
-                Running experiment...
+          <div className="space-y-1.5">
+            <div className="border border-border rounded-md overflow-hidden text-xs font-mono">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 bg-muted">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                <span className="text-muted-foreground">running...</span>
               </div>
             </div>
           </div>
