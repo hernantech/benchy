@@ -26,18 +26,25 @@ const RUNNER_URL = process.env.RUNNER_URL || "http://benchagent-pi:8420";
 // Load wiring reference docs at startup (not per-request)
 let WIRING_CHEATSHEET = "";
 let FULL_WIRING_REFERENCE = "";
-try {
-  const docsDir = join(process.cwd(), "..", "docs");
-  WIRING_CHEATSHEET = readFileSync(join(docsDir, "WIRING_CHEATSHEET.md"), "utf-8");
-  FULL_WIRING_REFERENCE = readFileSync(join(docsDir, "ESP32-S3-DevKitC-1-U-WIRING-REFERENCE.md"), "utf-8");
-} catch {
-  // Fallback: try relative to project root
-  try {
-    WIRING_CHEATSHEET = readFileSync(join(process.cwd(), "docs", "WIRING_CHEATSHEET.md"), "utf-8");
-    FULL_WIRING_REFERENCE = readFileSync(join(process.cwd(), "docs", "ESP32-S3-DevKitC-1-U-WIRING-REFERENCE.md"), "utf-8");
-  } catch {
-    console.warn("[agent] Wiring docs not found — agent will have limited wiring guidance");
+let AD_PINOUT_REFERENCE = "";
+
+function tryLoadDoc(filename: string): string {
+  const paths = [
+    join(process.cwd(), "..", "docs", filename),
+    join(process.cwd(), "docs", filename),
+  ];
+  for (const p of paths) {
+    try { return readFileSync(p, "utf-8"); } catch { /* next */ }
   }
+  return "";
+}
+
+WIRING_CHEATSHEET = tryLoadDoc("WIRING_CHEATSHEET.md");
+FULL_WIRING_REFERENCE = tryLoadDoc("ESP32-S3-DevKitC-1-U-WIRING-REFERENCE.md");
+AD_PINOUT_REFERENCE = tryLoadDoc("ANALOG_DISCOVERY_PINOUT.md");
+
+if (!WIRING_CHEATSHEET) {
+  console.warn("[agent] Wiring docs not found — agent will have limited wiring guidance");
 }
 
 export async function POST(req: Request) {
@@ -410,66 +417,76 @@ Examples:
         }),
 
         wiring_reference: tool({
-          description: `Look up detailed wiring information for the ESP32-S3-DevKitC-1-U board.
-Use this when you need:
-- Exact GPIO pin numbers and header positions
-- Which pins are safe vs reserved (USB, strapping, PSRAM)
-- ADC channel assignments
-- Peripheral pin defaults (I2C, SPI, UART, CAN)
-- Power supply connection details
-- Board orientation and header layout
+          description: `Look up detailed wiring information for the hardware setup.
+Two documents available:
+1. "esp32" — ESP32-S3-DevKitC-1-U pinout, GPIO safety, header layout, peripheral defaults
+2. "ad" or "analog_discovery" — Analog Discovery (original) pinout, wire colors (orange=CH1, blue=CH2, pink=DIO0, etc.), connector layout
 
-The quick cheatsheet is already in your system prompt. Use this tool for the FULL reference (pinout tables, safety classification, strapping pin details).`,
+Use this when you need:
+- Exact GPIO pin numbers and header positions (esp32)
+- Wire colors for the Analog Discovery fly-wire cable (ad)
+- Which pins are safe vs reserved (esp32)
+- How to connect scope/UART/I2C probes (both docs)
+- Power supply connection details (both docs)
+
+The quick cheatsheet (with wire colors) is already in your system prompt. Use this tool for the FULL reference.`,
           inputSchema: z.object({
+            doc: z
+              .enum(["esp32", "ad", "analog_discovery", "all"])
+              .default("all")
+              .describe("Which reference doc: 'esp32' for the dev board, 'ad' for Analog Discovery, 'all' for both"),
             section: z
               .string()
               .optional()
               .describe(
-                "Optional: specific section to look up (e.g., 'pinout', 'power', 'i2c', 'safety', 'strapping'). If omitted, returns the full reference."
+                "Optional: specific section to look up (e.g., 'pinout', 'power', 'i2c', 'safety', 'scope', 'digital', 'wire color')"
               ),
           }),
-          execute: async ({ section }) => {
-            if (!FULL_WIRING_REFERENCE) {
-              return {
-                error:
-                  "Wiring reference not loaded. Use the cheatsheet in the system prompt.",
-              };
+          execute: async ({ doc, section }) => {
+            // Select which docs to search
+            const docs: { name: string; content: string }[] = [];
+            if (doc === "esp32" || doc === "all") {
+              if (FULL_WIRING_REFERENCE) docs.push({ name: "ESP32-S3 DevKitC-1-U", content: FULL_WIRING_REFERENCE });
             }
+            if (doc === "ad" || doc === "analog_discovery" || doc === "all") {
+              if (AD_PINOUT_REFERENCE) docs.push({ name: "Analog Discovery (Original)", content: AD_PINOUT_REFERENCE });
+            }
+
+            if (docs.length === 0) {
+              return { error: "Reference docs not loaded. Use the cheatsheet in the system prompt." };
+            }
+
             if (section) {
-              // Find the relevant section by heading
-              const lines = FULL_WIRING_REFERENCE.split("\n");
               const sectionLower = section.toLowerCase();
-              let capturing = false;
-              let result = "";
-              let depth = 0;
-              for (const line of lines) {
-                if (
-                  line.startsWith("#") &&
-                  line.toLowerCase().includes(sectionLower)
-                ) {
-                  capturing = true;
-                  depth = line.split(" ")[0].length; // number of # chars
-                  result += line + "\n";
-                } else if (capturing) {
-                  if (
-                    line.startsWith("#") &&
-                    line.split(" ")[0].length <= depth
-                  ) {
-                    break; // hit next section at same or higher level
+              const results: { doc: string; content: string }[] = [];
+              for (const d of docs) {
+                const lines = d.content.split("\n");
+                let capturing = false;
+                let result = "";
+                let depth = 0;
+                for (const line of lines) {
+                  if (line.startsWith("#") && line.toLowerCase().includes(sectionLower)) {
+                    capturing = true;
+                    depth = line.split(" ")[0].length;
+                    result += line + "\n";
+                  } else if (capturing) {
+                    if (line.startsWith("#") && line.split(" ")[0].length <= depth) break;
+                    result += line + "\n";
                   }
-                  result += line + "\n";
                 }
+                if (result) results.push({ doc: d.name, content: result });
               }
-              return {
-                section,
-                content:
-                  result || `Section '${section}' not found. Try: pinout, power, safety, strapping, wiring, i2c, uart, adc`,
-              };
+              if (results.length > 0) return { section, results };
+              return { section, error: `Section '${section}' not found. Try: pinout, power, scope, digital, wire color, safety, i2c, uart` };
             }
-            // Return full doc (truncated if huge)
+
+            // Return full docs (truncated)
             return {
-              content: FULL_WIRING_REFERENCE.slice(0, 15000),
-              truncated: FULL_WIRING_REFERENCE.length > 15000,
+              documents: docs.map(d => ({
+                name: d.name,
+                content: d.content.slice(0, 10000),
+                truncated: d.content.length > 10000,
+              })),
             };
           },
         }),

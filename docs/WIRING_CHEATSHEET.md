@@ -41,6 +41,21 @@
 - Fixture pulls LOW for 100ms to reset DUT, then releases to high-Z
 - DUT has internal pull-up on EN — will boot when released
 
+### Analog Discovery (Original) Wire Colors
+| Color | Signal | Use |
+|-------|--------|-----|
+| Orange | 1+ (Scope CH1+) | Timing pulse (GPIO4) or voltage measurement |
+| Orange/White | 1- (Scope CH1-) | Connect to GND for single-ended measurement |
+| Blue | 2+ (Scope CH2+) | Second channel (3V3 rail monitoring) |
+| Blue/White | 2- (Scope CH2-) | Connect to GND |
+| Yellow | W1 (Waveform Gen 1) | Inject test signals (keep ≤3.3V for ESP32!) |
+| Red | V+ (+5V fixed) | NOT for powering ESP32 (50mA limit) |
+| Black (×4) | GND | Common ground — connect at least one to circuit |
+| Pink | DIO 0 | UART RX capture / I2C SDA monitor |
+| Green | DIO 1 | I2C SCL monitor |
+| Purple | DIO 2 | General digital capture |
+| Brown | DIO 3 | General digital capture |
+
 ### Safety Rules
 - ESP32-S3 is 3.3V logic — NEVER apply 5V to any GPIO
 - DPS-150 safety clamps: max 5.5V, max 1.0A (enforced in software)
