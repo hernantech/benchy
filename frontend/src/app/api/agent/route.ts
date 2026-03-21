@@ -48,12 +48,18 @@ export async function POST(req: Request) {
       model: google("gemini-3.1-pro-preview"),
       system: `You are Benchy, an AI hardware test agent. You control real lab instruments to test, diagnose, and fix hardware issues on ESP32-S3 development boards.
 
-## Instruments
+## Architecture
+All instruments are connected to a Raspberry Pi 5 ("bench runner") via USB.
+You control them through HTTP API calls to the Pi worker.
+A phone camera streams video directly to the Pi over Tailscale (not through this server).
+When you call camera_analyze, the Pi sends its latest camera frame to Gemini vision.
+
+## Instruments (all on the Pi)
 - DPS-150 Power Supply (0-30V, 0-5.5A) — set voltage, current limit, sweep
 - Digilent Analog Discovery — oscilloscope (2ch, 0-indexed), waveform generator, logic analyzer, protocol decoders (I2C/SPI/UART)
 - ESP32-S3 DUT board — configurable via JSON commands (PWM, I2C, UART, CAN, GPIO, ADC, WiFi)
 - ESP32-S3 Fixture board — I2C slave, DUT reset control, load injection, UART relay
-- Phone camera — live video stream for bench verification (use camera_analyze tool)
+- Phone camera — streams to Pi over Tailscale; use camera_status to check, camera_analyze to see the bench
 
 ## Workflow
 1. If the user needs help with wiring, use camera_analyze to see the bench and guide them. You can also use the wiring_reference tool for detailed pin information.
@@ -461,13 +467,15 @@ The quick cheatsheet is already in your system prompt. Use this tool for the FUL
         }),
 
         camera_analyze: tool({
-          description: `Analyze the lab bench using the phone camera + Gemini vision.
+          description: `Analyze the lab bench using the phone camera + Gemini 3.1 Flash Lite vision.
+The phone streams video directly to the Pi over Tailscale. This tool grabs the latest frame from the Pi and sends it to Gemini for analysis.
 Use this to:
 - Verify wiring is correct before running tests ("Are the I2C wires connected between the two ESP32 boards?")
-- Identify instruments ("What instruments are on the bench?")
+- Identify instruments and boards ("What instruments are on the bench?")
 - Check probe placement ("Is the scope probe on the 3V3 rail?")
 - Diagnose physical issues ("Why might the ESP32 not be powering on?")
-The phone must be streaming video via the Flutter app.`,
+- Guide the user step-by-step through wiring changes ("Now connect the yellow wire from J1-12 to...")
+Call camera_status first to check if the phone is streaming.`,
           inputSchema: z.object({
             prompt: z
               .string()
