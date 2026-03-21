@@ -64,17 +64,41 @@ When you call camera_analyze, the Pi sends its latest camera frame to Gemini vis
 ## Instruments (all on the Pi)
 - DPS-150 Power Supply (0-30V, 0-5.5A) — set voltage, current limit, sweep
 - Digilent Analog Discovery — oscilloscope (2ch, 0-indexed), waveform generator, logic analyzer, protocol decoders (I2C/SPI/UART)
-- ESP32-S3 DUT board — configurable via JSON commands (PWM, I2C, UART, CAN, GPIO, ADC, WiFi)
+- ESP32-S3 DUT board — has configurable test-bed firmware accepting JSON commands (PWM, I2C, UART, CAN, GPIO, ADC, WiFi, benchmark kernels)
 - ESP32-S3 Fixture board — I2C slave, DUT reset control, load injection, UART relay
 - Phone camera — streams to Pi over Tailscale; use camera_status to check, camera_analyze to see the bench
 
+## Two Modes of Operation
+
+### Mode 1: Runtime Configuration (fast, no compile)
+The DUT has pre-flashed test-bed firmware that accepts JSON commands over serial.
+Use dut_command to configure peripherals on the fly: PWM, I2C, UART, CAN, GPIO, ADC, WiFi.
+Use run_benchmark to run pre-compiled DSP kernels (baseline, fir_naive, fir_esp_dsp, optimized).
+This is instant — no compilation needed.
+
+### Mode 2: Custom Firmware Generation (when the user wants NEW firmware)
+You CAN write, compile, and flash completely new firmware to the ESP32-S3.
+Use the generate_firmware tool to trigger the firmware pipeline:
+1. Gemini 3.1 Pro architects the firmware (reads docs, decomposes into subtasks)
+2. Gemini Flash Lite workers generate code files in parallel
+3. Pro stitches everything together, writes main.cpp, verifies correctness
+4. PlatformIO compiles on the Pi — if it fails, Pro diagnoses errors and Flash Lite fixes them (up to 3 attempts)
+5. Firmware is flashed to the DUT and benchmarked with real instruments
+
+Use Mode 2 when:
+- The user asks you to "write firmware" or "create a driver"
+- The user wants custom signal processing, protocol handling, or control logic
+- The user wants ISA-optimized code for the ESP32-S3 Xtensa LX7
+- The pre-flashed test-bed firmware can't do what's needed
+
 ## Workflow
 1. If the user needs help with wiring, use camera_analyze to see the bench and guide them. You can also use the wiring_reference tool for detailed pin information.
-2. Plan the experiment steps
-3. Execute using tools (set_psu, capture_scope, dut_command, etc.)
-4. Analyze results (waveform stats, UART logs, scope charts)
-5. Report findings with specific measurements and units
-6. If failure detected, use the RCA pipeline to diagnose root cause
+2. Decide: use Mode 1 (runtime config) or Mode 2 (generate firmware) based on what the user asks
+3. Plan the experiment steps
+4. Execute using tools (set_psu, capture_scope, dut_command, generate_firmware, etc.)
+5. Analyze results (waveform stats, UART logs, scope charts)
+6. Report findings with specific measurements and units
+7. If failure detected, use the RCA pipeline to diagnose root cause
 
 ## Root Cause Analysis (RCA) Workflow
 When diagnosing hardware failures, use the RCA analysis pipeline:
@@ -368,9 +392,67 @@ Examples:
           },
         }),
 
+        generate_firmware: tool({
+          description: `Generate, compile, and flash custom firmware to the ESP32-S3 DUT.
+This triggers the full firmware pipeline:
+1. Gemini 3.1 Pro architects the firmware (reads your goal + any reference docs/code)
+2. Flash Lite workers generate code files in parallel from the spec
+3. Pro stitches them together, writes main.cpp, verifies correctness
+4. PlatformIO compiles for ESP32-S3 — if it fails, Pro diagnoses and Flash Lite fixes (up to 3 retries)
+5. Firmware is flashed to the DUT and tested
+
+Use this when the user wants CUSTOM firmware — not when they just want to configure the existing test-bed firmware via JSON commands.
+The pipeline takes 1-3 minutes depending on complexity and compile retries.`,
+          inputSchema: z.object({
+            goal: z
+              .string()
+              .describe(
+                "What the firmware should do (e.g., 'FIR filter optimized for ESP32-S3 Xtensa LX7 with GPIO timing harness')"
+              ),
+            source_code: z
+              .string()
+              .optional()
+              .describe(
+                "Existing C/C++ code to optimize or build upon (optional)"
+              ),
+            reference_docs: z
+              .string()
+              .optional()
+              .describe(
+                "Reference documentation, datasheets, or API specs (optional)"
+              ),
+            instructions: z
+              .string()
+              .optional()
+              .describe("Additional instructions for the firmware pipeline"),
+          }),
+          execute: async ({ goal, source_code, reference_docs, instructions }) => {
+            const PIPELINE_URL = process.env.PIPELINE_URL || "http://pipeline:8002";
+            try {
+              const res = await fetch(`${PIPELINE_URL}/firmware`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  runner_url: RUNNER_URL,
+                  goal,
+                  source_code: source_code || "",
+                  reference_docs: reference_docs || "",
+                  instructions: instructions || "",
+                }),
+              });
+              if (!res.ok) {
+                return { error: `Pipeline returned ${res.status}: ${await res.text()}` };
+              }
+              return await res.json();
+            } catch (e) {
+              return { error: `Failed to reach firmware pipeline: ${e}` };
+            }
+          },
+        }),
+
         run_benchmark: tool({
           description:
-            "Execute a firmware benchmark: select kernel on ESP32, measure execution time via GPIO pulse + scope, measure power via PSU.",
+            "Execute a firmware benchmark: select kernel on ESP32, measure execution time via GPIO pulse + scope, measure power via PSU. Works with both pre-flashed test-bed kernels AND newly generated firmware.",
           inputSchema: z.object({
             kernel: z
               .string()
