@@ -593,6 +593,26 @@ export function AgentChat() {
         throw new Error(errMsg);
       }
 
+      // Handle both SSE (text/event-stream) and plain JSON responses
+      const contentType = res.headers.get("Content-Type") || "";
+      if (!contentType.includes("text/event-stream")) {
+        // Plain JSON fallback — backend doesn't have SSE yet
+        stopTimer();
+        const data = await res.json();
+        const toolCalls = (data.toolCalls || []).map((tc: Record<string, unknown>) => ({
+          ...tc,
+          status: "done" as const,
+        }));
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: data.text || "", toolCalls },
+        ]);
+        setStatus({ phase: "done", message: "Done", elapsed_s: Math.round((Date.now() - startTimeRef.current) / 1000), stepCount: toolCalls.length });
+        setIsLoading(false);
+        setTimeout(() => setStatus({ phase: "idle", message: "", elapsed_s: 0, stepCount: 0 }), 2000);
+        return;
+      }
+
       await readSSEStream(res, {
         onStatus: (phase, message) => {
           setStatus((prev) => ({ ...prev, phase: phase as AgentStatus["phase"], message }));
