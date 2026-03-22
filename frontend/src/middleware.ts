@@ -6,7 +6,7 @@ export function middleware(request: NextRequest) {
   const response = NextResponse.next();
 
   console.log(
-    `${request.method} ${request.nextUrl.pathname} [${request.ip ?? "unknown"}]`
+    `${request.method} ${request.nextUrl.pathname} [${request.headers.get("x-forwarded-for") ?? "unknown"}]`
   );
 
   return response;
